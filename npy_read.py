@@ -2,6 +2,11 @@ import re
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from sklearn.model_selection import GroupKFold, cross_val_predict
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import RidgeCV
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import os
 
 folder = r"C:\Users\chent\PycharmProjects\Research\OASIS\barcodes_OASIS\G3\cs5_os3\CCs36_Cycles37\UNKNOWN"
@@ -35,8 +40,8 @@ for f in files:
     })
 
 img_df = pd.DataFrame(rows)
-# pd.set_option('display.max_columns', None)
-# print(img_df)
+pd.set_option('display.max_columns', None)
+#print(img_df)
 
 def load_npy_array(row):
     """
@@ -83,3 +88,49 @@ img_df["img_array"] = img_df.apply(load_npy_array, axis=1)
 # plt.imshow(img_df.loc[1, "img_array"], cmap="gray")
 # plt.title(img_df.loc[1, "file"])
 # plt.show()
+
+# Next, try associate those images with csv file CDRSUM
+# Match imaging and clinical data by participant and nearest session number
+cross = img_df.merge(clin, on='OASISID', how='inner')
+cross['abs_diff'] = (cross['clinical_session'] - cross['imaging_session']).abs()
+
+# For each image, pick the clinical record with the smallest session difference
+idx = cross.groupby('file')['abs_diff'].idxmin()
+matched = cross.loc[idx].reset_index(drop=True)
+
+# Show result
+# any failed loads?
+print("null arrays:", img_df['img_array'].isna().sum())
+
+# drop rows where loading/validation failed
+img_df = img_df.dropna(subset=['img_array']).reset_index(drop=True)
+
+# after matching: how close are visits?
+print(matched['abs_diff'].describe())
+print("max gap (days):", matched['abs_diff'].max())
+
+
+# Playgrounds for experimental analysis
+# Here we perform some basic regression first to see if any patterns
+# Flatten each 73×73 array into a 1D vector (5329 features)
+X = np.stack([arr.ravel() for arr in matched['img_array']])
+y = matched['CDRSUM'].astype(float).values
+groups = matched['OASISID'].values  # group by participant for safe CV
+print("Feature matrix:", X.shape)
+print("Target shape:", y.shape)
+
+cv = GroupKFold(n_splits=min(5, len(np.unique(groups))))
+pipe = Pipeline([
+    ('scaler', StandardScaler()),  # normalize pixel intensities
+    ('ridge', RidgeCV(alphas=np.logspace(-3, 3, 13), cv=5))
+])
+y_pred = cross_val_predict(pipe, X, y, cv=cv, groups=groups)
+
+mae = mean_absolute_error(y, y_pred)
+rmse = mean_squared_error(y, y_pred, squared=False)
+r2 = r2_score(y, y_pred)
+
+print(f"Results (GroupKFold CV):")
+print(f"MAE  = {mae:.3f}")
+print(f"RMSE = {rmse:.3f}")
+print(f"R²   = {r2:.3f}")
