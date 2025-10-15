@@ -126,11 +126,9 @@ pipe = Pipeline([
 ])
 y_pred = cross_val_predict(pipe, X, y, cv=cv, groups=groups)
 
-mae = mean_absolute_error(y, y_pred)
-rmse = mean_squared_error(y, y_pred, squared=False)
-r2 = r2_score(y, y_pred)
-
 print(f"Results (GroupKFold CV):")
-print(f"MAE  = {mae:.3f}")
-print(f"RMSE = {rmse:.3f}")
-print(f"R²   = {r2:.3f}")
+mae = mean_absolute_error(y, y_pred)
+mse = mean_squared_error(y, y_pred)   # always supported
+rmse = np.sqrt(mse)                   # version-agnostic RMSE
+r2 = r2_score(y, y_pred)
+print(f"MAE={mae:.3f}  RMSE={rmse:.3f}  R²={r2:.3f}")
