@@ -3,11 +3,9 @@ import os
 import pandas as pd
 import numpy as np
 import torch
-from sklearn.model_selection import GroupKFold, cross_val_predict
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import RidgeCV
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
 
 
 folder = r"C:\Users\chent\PycharmProjects\Research\OASIS\barcodes_OASIS\G3\cs5_os3\CCs36_Cycles37\UNKNOWN"
@@ -114,22 +112,66 @@ print("max gap (days):", matched['abs_diff'].max())
 # Playgrounds for experimental analysis
 # Here we perform some basic regression first to see if any patterns
 # Flatten each 73×73 array into a 1D vector (5329 features)
-X = np.stack([arr.ravel() for arr in matched['img_array']])
-y = matched['CDRSUM'].astype(float).values
-groups = matched['OASISID'].values  # group by participant for safe CV
-print("Feature matrix:", X.shape)
-print("Target shape:", y.shape)
+# X = np.stack([arr.ravel() for arr in matched['img_array']])
+# y = matched['CDRSUM'].astype(float).values
+# groups = matched['OASISID'].values  # group by participant for safe CV
+# print("Feature matrix:", X.shape)
+# print("Target shape:", y.shape)
+#
+# cv = GroupKFold(n_splits=min(5, len(np.unique(groups))))
+# pipe = Pipeline([
+#     ('scaler', StandardScaler()),  # normalize pixel intensities
+#     ('ridge', RidgeCV(alphas=np.logspace(-3, 3, 13), cv=5))
+# ])
+# y_pred = cross_val_predict(pipe, X, y, cv=cv, groups=groups)
+#
+# print(f"Results (GroupKFold CV):")
+# mae = mean_absolute_error(y, y_pred)
+# mse = mean_squared_error(y, y_pred)   # always supported
+# rmse = np.sqrt(mse)                   # version-agnostic RMSE
+# r2 = r2_score(y, y_pred)
+# print(f"MAE={mae:.3f}  RMSE={rmse:.3f}  R²={r2:.3f}") Not giving desired result.
+X = np.stack([a for a in matched['img_array']])     # shape (N, 73, 73)
+y = matched['CDRSUM'].values.astype(np.float32)     # shape (N,)
 
-cv = GroupKFold(n_splits=min(5, len(np.unique(groups))))
-pipe = Pipeline([
-    ('scaler', StandardScaler()),  # normalize pixel intensities
-    ('ridge', RidgeCV(alphas=np.logspace(-3, 3, 13), cv=5))
-])
-y_pred = cross_val_predict(pipe, X, y, cv=cv, groups=groups)
+# add channel dimension: (N, 1, 73, 73)
+X = torch.tensor(X, dtype=torch.float32).unsqueeze(1)
+y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
 
-print(f"Results (GroupKFold CV):")
-mae = mean_absolute_error(y, y_pred)
-mse = mean_squared_error(y, y_pred)   # always supported
-rmse = np.sqrt(mse)                   # version-agnostic RMSE
-r2 = r2_score(y, y_pred)
-print(f"MAE={mae:.3f}  RMSE={rmse:.3f}  R²={r2:.3f}")
+
+class CDRNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 16, 3, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc1 = nn.Linear(32 * 18 * 18, 64)
+        self.fc2 = nn.Linear(64, 1)
+
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))   # (N,16,36,36)
+        x = self.pool(F.relu(self.conv2(x)))   # (N,32,18,18)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
+dataset = TensorDataset(X, y)
+loader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+model = CDRNet()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn = nn.MSELoss()
+
+for epoch in range(50):
+    model.train()
+    total_loss = 0
+    for xb, yb in loader:
+        pred = model(xb)
+        loss = loss_fn(pred, yb)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * len(xb)
+    print(f"Epoch {epoch+1}, MSE={total_loss/len(dataset):.4f}")
+model.eval()
+with torch.no_grad():
+    preds = model(X).squeeze().numpy()
