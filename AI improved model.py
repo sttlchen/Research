@@ -35,7 +35,7 @@ CLIN_PATH = r"C:\Users\chent\PycharmProjects\Research\OASIS\final_clinical_data.
 
 EXPECTED_SHAPE = (73, 73)
 USE_QUANTILE_Y = True       # transform targets to ~Normal for NN training, invert for metrics
-N_SPLITS = 5                # GroupKFold splits (by OASISID)
+N_SPLITS = 10                # GroupKFold splits (by OASISID)
 SEED = 42
 
 # Baseline (linear) model config
@@ -43,11 +43,11 @@ PCA_VARIANCE = 0.95         # keep 95% explained variance
 RIDGE_ALPHAS = np.logspace(-3, 3, 13)
 
 # CNN config
-EPOCHS = 100
+EPOCHS = 150
 BATCH_SIZE = 32            # smaller helps minority gradient show up; scale up only with class-balanced batches
 LR = 3e-4                  # slightly lower than 1e-3 for stability with weights/focal
 WEIGHT_DECAY = 5e-4        # a touch stronger regularization is often helpful
-PATIENCE = 12              # let PRC/F1 breathe
+PATIENCE = 15               # let PRC/F1 breathe
 
 # TDA config
 USE_TDA = True              # try TDA if libs are present; auto-disabled if libs missing
@@ -144,7 +144,7 @@ X = np.stack(X_norm).astype(np.float32)  # (N, 73, 73)
 
 # Optional target transform for NN; linear models stay on original scale
 if USE_QUANTILE_Y:
-    qt = QuantileTransformer(output_distribution='normal', n_quantiles=min(1000, len(y_raw)))
+    qt = QuantileTransformer(output_distribution='normal', n_quantiles=min(4000, len(y_raw)))
     y_trans = qt.fit_transform(y_raw.reshape(-1, 1)).astype(np.float32).ravel()
 else:
     y_trans = y_raw
@@ -310,114 +310,114 @@ print(f"MAE  : {mean_absolute_error(y_true_cnn, y_pred_cnn):.3f}")
 print(f"RMSE : {rmse(y_true_cnn, y_pred_cnn):.3f}")
 print(f"R^2  : {r2_score(y_true_cnn, y_pred_cnn):.3f}")
 
-print("\n=== TDA (cubical complex -> persistence images -> ElasticNet), grouped CV ===")
-if USE_TDA and TDA_AVAILABLE:
-    # -- ensure we really use persim.PersistenceImager --
-    from persim import PersistenceImager
+# print("\n=== TDA (cubical complex -> persistence images -> ElasticNet), grouped CV ===")
+# if USE_TDA and TDA_AVAILABLE:
+#     # -- ensure we really use persim.PersistenceImager --
+#     from persim import PersistenceImager
+#
+#     def _build_persim_imager_for_038(pixels, value_range, spread):
+#         """
+#         persim 0.3.8 API:
+#           - pixel_size: float (square pixels)
+#           - birth_range, pers_range
+#           - kernel='gaussian', kernel_params={'sigma': [[s,0],[0,s]]}
+#         We choose pixel_size so the resulting grid is ~pixels along both axes.
+#         """
+#         (nx, ny) = int(pixels[0]), int(pixels[1])
+#         (bmin, bmax), (pmin, pmax) = value_range
+#         db = float(bmax) - float(bmin)
+#         dp = float(pmax) - float(pmin)
+#         # square pixels: pick the smaller step to not exceed desired bins on either axis
+#         pixel_size = min(db / max(nx, 1), dp / max(ny, 1))
+#         sigma = float(spread)
+#         sigma_mat = [[sigma, 0.0], [0.0, sigma]]
+#         return PersistenceImager(
+#             pixel_size=float(pixel_size),
+#             birth_range=(float(bmin), float(bmax)),
+#             pers_range=(float(pmin), float(pmax)),
+#             kernel="gaussian",
+#             kernel_params={"sigma": sigma_mat},
+#             # weighting="persistence"  # default; set explicitly if you want
+#         )
+#
+#     def _persim_transform_038(pi, d_bp, pixels):
+#         """Transform a (n,2) birth/persistence diagram into a 2D image."""
+#         if d_bp.size == 0:
+#             return np.zeros((int(pixels[0]), int(pixels[1])), dtype=np.float32)
+#         img = pi.transform(d_bp)  # returns 2D array
+#         img = np.asarray(img, dtype=np.float32)
+#         return img
+#
+#     def persistence_image_for_array(arr2d, value_range=TDA_PI_RANGE, spread=TDA_PI_SPREAD, pixels=TDA_PI_BINS):
+#         """
+#         Compute a persistence image from a 2D array via CubicalComplex.
+#         Concatenate H0 and H1 persistence images and return a 1D feature vector.
+#         """
+#         # Rescale to [0,1] (low values born earlier)
+#         a = arr2d
+#         amin, amax = float(np.nanmin(a)), float(np.nanmax(a))
+#         if not np.isfinite(amin): amin = 0.0
+#         if (not np.isfinite(amax)) or (amax - amin < 1e-8): amax = amin + 1.0
+#         a01 = (a - amin) / (amax - amin)
+#
+#         # Cubical complex & diagram
+#         cc = gd.CubicalComplex(dimensions=a01.shape, top_dimensional_cells=a01.flatten())
+#         diag = cc.persistence(homology_coeff_field=2)
+#
+#         # Extract finite birth/death pairs by dimension
+#         d0 = np.array([p[1] for p in diag if p[0] == 0 and np.isfinite(p[1][0]) and np.isfinite(p[1][1])], dtype=float)
+#         d1 = np.array([p[1] for p in diag if p[0] == 1 and np.isfinite(p[1][0]) and np.isfinite(p[1][1])], dtype=float)
+#
+#         # Convert (birth, death) -> (birth, persistence) for persim
+#         def to_birth_pers(d):
+#             if d.size == 0: return np.empty((0, 2), dtype=float)
+#             return np.column_stack([d[:, 0], d[:, 1] - d[:, 0]])
+#
+#         d0_bp, d1_bp = to_birth_pers(d0), to_birth_pers(d1)
+#
+#         # Build imager (0.3.8 API) and render
+#         pi = _build_persim_imager_for_038(pixels, value_range, spread)
+#         img0 = _persim_transform_038(pi, d0_bp, pixels) if d0_bp.size else np.zeros((pixels[0], pixels[1]), np.float32)
+#         img1 = _persim_transform_038(pi, d1_bp, pixels) if d1_bp.size else np.zeros((pixels[0], pixels[1]), np.float32)
+#
+#         # Concatenate channels as features
+#         feat = np.concatenate([img0.ravel(), img1.ravel()]).astype(np.float32)
+#         return feat
 
-    def _build_persim_imager_for_038(pixels, value_range, spread):
-        """
-        persim 0.3.8 API:
-          - pixel_size: float (square pixels)
-          - birth_range, pers_range
-          - kernel='gaussian', kernel_params={'sigma': [[s,0],[0,s]]}
-        We choose pixel_size so the resulting grid is ~pixels along both axes.
-        """
-        (nx, ny) = int(pixels[0]), int(pixels[1])
-        (bmin, bmax), (pmin, pmax) = value_range
-        db = float(bmax) - float(bmin)
-        dp = float(pmax) - float(pmin)
-        # square pixels: pick the smaller step to not exceed desired bins on either axis
-        pixel_size = min(db / max(nx, 1), dp / max(ny, 1))
-        sigma = float(spread)
-        sigma_mat = [[sigma, 0.0], [0.0, sigma]]
-        return PersistenceImager(
-            pixel_size=float(pixel_size),
-            birth_range=(float(bmin), float(bmax)),
-            pers_range=(float(pmin), float(pmax)),
-            kernel="gaussian",
-            kernel_params={"sigma": sigma_mat},
-            # weighting="persistence"  # default; set explicitly if you want
-        )
-
-    def _persim_transform_038(pi, d_bp, pixels):
-        """Transform a (n,2) birth/persistence diagram into a 2D image."""
-        if d_bp.size == 0:
-            return np.zeros((int(pixels[0]), int(pixels[1])), dtype=np.float32)
-        img = pi.transform(d_bp)  # returns 2D array
-        img = np.asarray(img, dtype=np.float32)
-        return img
-
-    def persistence_image_for_array(arr2d, value_range=TDA_PI_RANGE, spread=TDA_PI_SPREAD, pixels=TDA_PI_BINS):
-        """
-        Compute a persistence image from a 2D array via CubicalComplex.
-        Concatenate H0 and H1 persistence images and return a 1D feature vector.
-        """
-        # Rescale to [0,1] (low values born earlier)
-        a = arr2d
-        amin, amax = float(np.nanmin(a)), float(np.nanmax(a))
-        if not np.isfinite(amin): amin = 0.0
-        if (not np.isfinite(amax)) or (amax - amin < 1e-8): amax = amin + 1.0
-        a01 = (a - amin) / (amax - amin)
-
-        # Cubical complex & diagram
-        cc = gd.CubicalComplex(dimensions=a01.shape, top_dimensional_cells=a01.flatten())
-        diag = cc.persistence(homology_coeff_field=2)
-
-        # Extract finite birth/death pairs by dimension
-        d0 = np.array([p[1] for p in diag if p[0] == 0 and np.isfinite(p[1][0]) and np.isfinite(p[1][1])], dtype=float)
-        d1 = np.array([p[1] for p in diag if p[0] == 1 and np.isfinite(p[1][0]) and np.isfinite(p[1][1])], dtype=float)
-
-        # Convert (birth, death) -> (birth, persistence) for persim
-        def to_birth_pers(d):
-            if d.size == 0: return np.empty((0, 2), dtype=float)
-            return np.column_stack([d[:, 0], d[:, 1] - d[:, 0]])
-
-        d0_bp, d1_bp = to_birth_pers(d0), to_birth_pers(d1)
-
-        # Build imager (0.3.8 API) and render
-        pi = _build_persim_imager_for_038(pixels, value_range, spread)
-        img0 = _persim_transform_038(pi, d0_bp, pixels) if d0_bp.size else np.zeros((pixels[0], pixels[1]), np.float32)
-        img1 = _persim_transform_038(pi, d1_bp, pixels) if d1_bp.size else np.zeros((pixels[0], pixels[1]), np.float32)
-
-        # Concatenate channels as features
-        feat = np.concatenate([img0.ravel(), img1.ravel()]).astype(np.float32)
-        return feat
-
-    # ---- Build TDA feature matrix ----
-    print("Computing TDA features...")
-    tda_feats = np.stack([persistence_image_for_array(x) for x in X])
-
-    # ---- Grouped CV with ElasticNet (unchanged) ----
-    gkf = GroupKFold(n_splits=min(N_SPLITS, len(np.unique(groups))))
-    en_cv_preds, en_cv_true = [], []
-    for fold, (tr, va) in enumerate(gkf.split(tda_feats, y_raw, groups=groups), 1):
-        Xtr, Xva = tda_feats[tr], tda_feats[va]
-        ytr, yva = y_raw[tr], y_raw[va]
-
-        scaler = StandardScaler()
-        Xtr_s = scaler.fit_transform(Xtr)
-        Xva_s = scaler.transform(Xva)
-
-        en = ElasticNetCV(l1_ratio=ELASTICNET_L1RATIOS, alphas=None, cv=5, max_iter=5000, n_jobs=None)
-        en.fit(Xtr_s, ytr)
-        pred_va = en.predict(Xva_s)
-
-        en_cv_preds.append(pred_va); en_cv_true.append(yva)
-
-    y_true_tda = np.concatenate(en_cv_true)
-    y_pred_tda = np.concatenate(en_cv_preds)
-    print(f"TDA (ElasticNet) CV metrics:")
-    print(f"MAE  : {mean_absolute_error(y_true_tda, y_pred_tda):.3f}")
-    print(f"RMSE : {rmse(y_true_tda, y_pred_tda):.3f}")
-    print(f"R^2  : {r2_score(y_true_tda, y_pred_tda):.3f}")
-
-    # Optional blend with Ridge if you computed it earlier
-    if 'y_pred_lin' in globals() and len(y_pred_lin) == len(y_pred_tda):
-        blend = 0.5 * y_pred_lin + 0.5 * y_pred_tda
-        print(f"\nBlend (Ridge ⨉ TDA) CV metrics:")
-        print(f"MAE  : {mean_absolute_error(y_true_lin, blend):.3f}")
-        print(f"RMSE : {rmse(y_true_lin, blend):.3f}")
-        print(f"R^2  : {r2_score(y_true_lin, blend):.3f}")
-else:
-    print("TDA disabled (missing dependencies or USE_TDA=False). Skipping TDA block.")
+#     # ---- Build TDA feature matrix ----
+#     print("Computing TDA features...")
+#     tda_feats = np.stack([persistence_image_for_array(x) for x in X])
+#
+#     # ---- Grouped CV with ElasticNet (unchanged) ----
+#     gkf = GroupKFold(n_splits=min(N_SPLITS, len(np.unique(groups))))
+#     en_cv_preds, en_cv_true = [], []
+#     for fold, (tr, va) in enumerate(gkf.split(tda_feats, y_raw, groups=groups), 1):
+#         Xtr, Xva = tda_feats[tr], tda_feats[va]
+#         ytr, yva = y_raw[tr], y_raw[va]
+#
+#         scaler = StandardScaler()
+#         Xtr_s = scaler.fit_transform(Xtr)
+#         Xva_s = scaler.transform(Xva)
+#
+#         en = ElasticNetCV(l1_ratio=ELASTICNET_L1RATIOS, alphas=None, cv=5, max_iter=5000, n_jobs=None)
+#         en.fit(Xtr_s, ytr)
+#         pred_va = en.predict(Xva_s)
+#
+#         en_cv_preds.append(pred_va); en_cv_true.append(yva)
+#
+#     y_true_tda = np.concatenate(en_cv_true)
+#     y_pred_tda = np.concatenate(en_cv_preds)
+#     print(f"TDA (ElasticNet) CV metrics:")
+#     print(f"MAE  : {mean_absolute_error(y_true_tda, y_pred_tda):.3f}")
+#     print(f"RMSE : {rmse(y_true_tda, y_pred_tda):.3f}")
+#     print(f"R^2  : {r2_score(y_true_tda, y_pred_tda):.3f}")
+#
+#     # Optional blend with Ridge if you computed it earlier
+#     if 'y_pred_lin' in globals() and len(y_pred_lin) == len(y_pred_tda):
+#         blend = 0.5 * y_pred_lin + 0.5 * y_pred_tda
+#         print(f"\nBlend (Ridge ⨉ TDA) CV metrics:")
+#         print(f"MAE  : {mean_absolute_error(y_true_lin, blend):.3f}")
+#         print(f"RMSE : {rmse(y_true_lin, blend):.3f}")
+#         print(f"R^2  : {r2_score(y_true_lin, blend):.3f}")
+# else:
+#     print("TDA disabled (missing dependencies or USE_TDA=False). Skipping TDA block.")
