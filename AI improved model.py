@@ -34,8 +34,8 @@ FOLDER = r"C:\Users\chent\PycharmProjects\Research\OASIS\barcodes_OASIS\G3\cs5_o
 CLIN_PATH = r"C:\Users\chent\PycharmProjects\Research\OASIS\final_clinical_data.csv"
 
 EXPECTED_SHAPE = (73, 73)
-USE_QUANTILE_Y = True       # transform targets to ~Normal for NN training, invert for metrics
-N_SPLITS = 10                # GroupKFold splits (by OASISID)
+USE_QUANTILE_Y = True     # transform targets to ~Normal for NN training, invert for metrics
+N_SPLITS = 5               # GroupKFold splits (by OASISID)
 SEED = 42
 
 # Baseline (linear) model config
@@ -45,9 +45,9 @@ RIDGE_ALPHAS = np.logspace(-3, 3, 13)
 # CNN config
 EPOCHS = 150
 BATCH_SIZE = 32            # smaller helps minority gradient show up; scale up only with class-balanced batches
-LR = 3e-4                  # slightly lower than 1e-3 for stability with weights/focal
+LR = 5e-4                   # slightly lower than 1e-3 for stability with weights/focal
 WEIGHT_DECAY = 5e-4        # a touch stronger regularization is often helpful
-PATIENCE = 15               # let PRC/F1 breathe
+PATIENCE = 100               # let PRC/F1 breathe
 
 # TDA config
 USE_TDA = True           # try TDA if libs are present; auto-disabled if libs missing
@@ -150,16 +150,29 @@ else:
     y_trans = y_raw
 
 # =========================
-# Torch dataset & CNN model
+# Torch dataset & CNN model (with weighted loss for zero-inflated y)
 # =========================
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+# --- helper: simple inverse-frequency weights for zero vs positive ---
+def make_sample_weights(y):
+    bins = (y > 0).astype(int)                 # 0 = zero, 1 = positive
+    freq = np.bincount(bins, minlength=2)      # [#zeros, #positives]
+    w = 1.0 / freq[bins]                       # inverse frequency
+    w *= (len(w) / w.sum())                    # normalize mean weight to 1
+    return w.astype(np.float32), bins
+
 class ImgRegDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32).unsqueeze(1) # (N,1,73,73)
-        self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1) # (N,1)
+    """Returns (X, y, idx_global) so we can fetch per-sample weights inside the loop."""
+    def __init__(self, X, y, idx_global=None):
+        self.X = torch.tensor(X, dtype=torch.float32).unsqueeze(1)  # (N,1,73,73)
+        self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)  # (N,1)
+        if idx_global is None:
+            idx_global = np.arange(len(y), dtype=np.int64)
+        self.idx_global = torch.tensor(idx_global, dtype=torch.long)
     def __len__(self): return len(self.X)
-    def __getitem__(self, i): return self.X[i], self.y[i]
+    def __getitem__(self, i):
+        return self.X[i], self.y[i], self.idx_global[i]
 
 class CDRNet(nn.Module):
     # A slightly deeper, regularized CNN with global-average-pooling to reduce params
@@ -185,45 +198,55 @@ class CDRNet(nn.Module):
             nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.25),
             nn.Linear(64, 1)
         )
-
     def forward(self, x):
         x = self.block1(x); x = self.block2(x); x = self.block3(x)
         x = self.gap(x)
         return self.head(x)
 
-def train_one_fold(model, train_loader, val_loader, epochs=EPOCHS, lr=LR):
+def train_one_fold(model, train_loader, val_loader, w_all=None, epochs=EPOCHS, lr=LR):
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=3)
-    huber = nn.HuberLoss(delta=1.0)
+    huber = nn.HuberLoss(delta=1.0, reduction='none')   # per-sample loss
 
     best_val, best_state, wait = math.inf, None, 0
     for ep in range(1, epochs+1):
         model.train()
         tr_loss_sum, n_tr = 0.0, 0
-        for xb, yb in train_loader:
+        for xb, yb, idx_global in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             pred = model(xb)
-            loss = huber(pred, yb)
+
+            # ----- weighted Huber loss (handles zero-inflated targets) -----
+            loss_per = huber(pred, yb).squeeze(-1)  # (B,)
+            if w_all is not None:
+                w_batch = torch.from_numpy(w_all[idx_global.cpu().numpy()]).to(pred.device)  # (B,)
+                loss = (w_batch * loss_per).sum() / w_batch.sum()
+            else:
+                loss = loss_per.mean()
+            # ----------------------------------------------------------------
+
             opt.zero_grad(); loss.backward(); opt.step()
             tr_loss_sum += loss.item() * xb.size(0); n_tr += xb.size(0)
         tr_loss = tr_loss_sum / max(1, n_tr)
 
-        # Validate (MSE on transformed target)
+        # Validate (unweighted MSE on transformed target)
         model.eval()
         val_loss_sum, n_val = 0.0, 0
         with torch.no_grad():
-            for xb, yb in val_loader:
+            for xb, yb, _ in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 pred = model(xb)
-                vloss = F.mse_loss(pred, yb)
+                vloss = F.mse_loss(pred, yb, reduction='mean')
                 val_loss_sum += vloss.item() * xb.size(0); n_val += xb.size(0)
         val_loss = val_loss_sum / max(1, n_val)
         sched.step(val_loss)
-        print(f"  Epoch {ep:02d}: train(Huber)={tr_loss:.4f}  val(MSE)={val_loss:.4f}")
+        print(f"  Epoch {ep:02d}: train(Huber-w)={tr_loss:.4f}  val(MSE)={val_loss:.4f}")
 
         # Early stopping
         if val_loss + 1e-6 < best_val:
-            best_val = val_loss; best_state = {k: v.cpu() for k, v in model.state_dict().items()}; wait = 0
+            best_val = val_loss
+            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            wait = 0
         else:
             wait += 1
             if wait >= PATIENCE: break
@@ -232,29 +255,40 @@ def train_one_fold(model, train_loader, val_loader, epochs=EPOCHS, lr=LR):
         model.load_state_dict(best_state)
     return model
 
-print("\n=== CNN (grouped CV on transformed y; metrics inverted to original scale) ===")
+print("\n=== CNN (grouped CV with weighted loss for zero-inflated y) ===")
+
+# Global weights from ORIGINAL target y_raw (not transformed)
+w_all, bins_01 = make_sample_weights(y_raw)
+
 gkf = GroupKFold(n_splits=min(N_SPLITS, len(np.unique(groups))))
 fold_preds, fold_true = [], []
 
-for fold, (tr_idx, va_idx) in enumerate(gkf.split(X, y_trans, groups=groups), 1):
+for fold, (tr_idx, va_idx) in enumerate(gkf.split(X, y_raw, groups=groups), 1):
     print(f"\n--- Fold {fold} ---")
     Xtr, Xva = X[tr_idx], X[va_idx]
-    ytr, yva = y_trans[tr_idx], y_trans[va_idx]
+    ytr_raw, yva_raw = y_raw[tr_idx], y_raw[va_idx]
 
-    ds_tr = ImgRegDataset(Xtr, ytr)
-    ds_va = ImgRegDataset(Xva, yva)
+    # Optional target transform (keeps your original behavior)
+    if USE_QUANTILE_Y:
+        qt = QuantileTransformer(output_distribution="normal", random_state=SEED)
+        ytr = qt.fit_transform(ytr_raw.reshape(-1,1)).ravel()
+        yva = qt.transform(yva_raw.reshape(-1,1)).ravel()
+    else:
+        ytr, yva = ytr_raw, yva_raw
 
+    ds_tr = ImgRegDataset(Xtr, ytr, idx_global=tr_idx)   # pass global indices for weighting
+    ds_va = ImgRegDataset(Xva, yva, idx_global=va_idx)   # idx not used in val, but harmless
     train_loader = DataLoader(ds_tr, batch_size=BATCH_SIZE, shuffle=True)
     val_loader   = DataLoader(ds_va, batch_size=max(64, BATCH_SIZE), shuffle=False)
 
     model = CDRNet().to(device)
-    model = train_one_fold(model, train_loader, val_loader)
+    model = train_one_fold(model, train_loader, val_loader, w_all=w_all)
 
     # Predict on validation fold
     model.eval()
     preds_va = []
     with torch.no_grad():
-        for xb, yb in val_loader:
+        for xb, _, _ in val_loader:
             xb = xb.to(device)
             preds_va.append(model(xb).cpu().numpy().ravel())
     preds_va = np.concatenate(preds_va)
@@ -262,7 +296,7 @@ for fold, (tr_idx, va_idx) in enumerate(gkf.split(X, y_trans, groups=groups), 1)
     # Invert target transform for metrics
     if USE_QUANTILE_Y:
         preds_va_real = qt.inverse_transform(preds_va.reshape(-1,1)).ravel()
-        yva_real      = qt.inverse_transform(yva.reshape(-1,1)).ravel()
+        yva_real      = yva_raw  # inverse-transform of yva equals yva_raw
     else:
         preds_va_real = preds_va; yva_real = yva
 
@@ -270,10 +304,11 @@ for fold, (tr_idx, va_idx) in enumerate(gkf.split(X, y_trans, groups=groups), 1)
 
 y_true_cnn = np.concatenate(fold_true)
 y_pred_cnn = np.concatenate(fold_preds)
-print(f"\nCNN CV metrics:")
+print(f"\nCNN CV metrics (weighted training):")
 print(f"MAE  : {mean_absolute_error(y_true_cnn, y_pred_cnn):.3f}")
 print(f"RMSE : {rmse(y_true_cnn, y_pred_cnn):.3f}")
 print(f"R^2  : {r2_score(y_true_cnn, y_pred_cnn):.3f}")
+
 
 # print("\n=== TDA (cubical complex -> persistence images -> ElasticNet), grouped CV ===")
 # if USE_TDA and TDA_AVAILABLE:
