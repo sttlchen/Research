@@ -132,6 +132,7 @@ print(matched['abs_diff'].describe())
 # =========================
 X = np.stack([np.asarray(a, dtype=np.float32) for a in matched['img_array']])  # (N, 73, 73)
 y_raw = matched['CDRSUM'].astype(np.float32).values
+print(np.mean(y_raw))
 groups = matched['OASISID'].values
 
 # # Per-image z-scoring improves stability
@@ -308,6 +309,54 @@ print(f"\nCNN CV metrics (weighted training):")
 print(f"MAE  : {mean_absolute_error(y_true_cnn, y_pred_cnn):.3f}")
 print(f"RMSE : {rmse(y_true_cnn, y_pred_cnn):.3f}")
 print(f"R^2  : {r2_score(y_true_cnn, y_pred_cnn):.3f}")
+
+# === Baseline & non-zero-only summary ===
+import numpy as np
+from sklearn.metrics import mean_absolute_error, r2_score
+
+y = y_true_cnn.astype(float)
+yhat = y_pred_cnn.astype(float)
+
+# Dataset snapshot
+pct_zero = 100.0 * np.mean(y == 0)
+mean_y   = float(np.mean(y))
+median_y = float(np.median(y))
+
+# Baselines (constant predictors)
+mae_zero   = float(np.mean(np.abs(y - 0)))            # == mean_y if y >= 0
+mae_mean   = float(np.mean(np.abs(y - mean_y)))
+mae_median = float(np.mean(np.abs(y - median_y)))
+
+# Overall metrics (already printed above, kept here for alignment)
+mae_all = float(mean_absolute_error(y, yhat))
+r2_all  = float(r2_score(y, yhat))
+
+# Non-zero subset
+mask_pos = y > 0
+if np.any(mask_pos):
+    mae_pos   = float(mean_absolute_error(y[mask_pos], yhat[mask_pos]))
+    r2_pos    = float(r2_score(y[mask_pos], yhat[mask_pos]))
+    nmae_pos  = float(mae_pos / np.mean(y[mask_pos]))  # normalized MAE on positives
+    n_pos     = int(mask_pos.sum())
+else:
+    mae_pos = r2_pos = nmae_pos = np.nan
+    n_pos = 0
+
+print("\n=== Data distribution ===")
+print(f"n={len(y)} | zeros={pct_zero:.1f}% | mean(y)={mean_y:.3f} | median(y)={median_y:.3f}")
+
+print("\n=== Constant baselines (lower MAE is better) ===")
+print(f"Always 0        : MAE = {mae_zero:.3f}")
+print(f"Always mean(y)  : MAE = {mae_mean:.3f}")
+print(f"Always median(y): MAE = {mae_median:.3f}")
+
+print("\n=== Model vs baselines ===")
+print(f"Model MAE (all) : {mae_all:.3f}   | vs Always-0: {(1 - mae_all/mae_zero)*100:.1f}% better")
+print(f"Model R^2  (all): {r2_all:.3f}")
+
+print("\n=== Non-zero subset (hard part) ===")
+print(f"n_pos={n_pos} | MAE_pos={mae_pos:.3f} | R^2_pos={r2_pos:.3f} | nMAE_pos={nmae_pos:.2f}")
+
 
 
 # print("\n=== TDA (cubical complex -> persistence images -> ElasticNet), grouped CV ===")
